@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ====================================================
-# Hysteria 2 端口跳跃版 (Port Hopping)
+# Hysteria 2 端口跳跃版 (自动识别地区 + Apple伪装)
 # 监听端口: 8899 (内部)
 # 公网端口: 50000-65535 (外部任选)
 # ====================================================
@@ -9,13 +9,13 @@
 # 0. 检查 Root
 if [[ $EUID -ne 0 ]]; then echo "必须 root 运行"; exit 1; fi
 
-# 1. 修复 DNS
+# 1. 修复 DNS (防止 API 查询失败)
 chattr -i /etc/resolv.conf >/dev/null 2>&1
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 echo "nameserver 1.1.1.1" >> /etc/resolv.conf
 
 echo "========================================================"
-echo "    正在部署 Hysteria 2 (端口跳跃版)..."
+echo "    正在部署 Hysteria 2 (Apple伪装 + 自动地区)..."
 echo "========================================================"
 
 # 2. 准备目录
@@ -23,14 +23,15 @@ mkdir -p /etc/hysteria
 cd /etc/hysteria
 rm -f server.crt server.key config.yaml
 
-# 3. 生成自签名证书 (伪装 www.bing.com)
-openssl req -x509 -nodes -newkey rsa:2048 -keyout server.key -out server.crt -days 3650 -subj "/CN=www.bing.com"
+# 3. 生成自签名证书 (修改为 apps.apple.com)
+echo "[*] 生成伪装证书 (apps.apple.com)..."
+openssl req -x509 -nodes -newkey rsa:2048 -keyout server.key -out server.crt -days 3650 -subj "/CN=apps.apple.com"
 
 # 4. 下载核心
 ARCH=$(uname -m)
 case $ARCH in
-    x86_64)  URL="https://github.com/apernet/hysteria/releases/download/app%2Fv2.2.4/hysteria-linux-amd64" ;;
-    aarch64) URL="https://github.com/apernet/hysteria/releases/download/app%2Fv2.2.4/hysteria-linux-arm64" ;;
+    x86_64)  URL="https://ghfast.top/https://github.com/apernet/hysteria/releases/download/app%2Fv2.2.4/hysteria-linux-amd64" ;;
+    aarch64) URL="https://ghfast.top/https://github.com/apernet/hysteria/releases/download/app%2Fv2.2.4/hysteria-linux-arm64" ;;
     *)       echo "不支持的架构: $ARCH"; exit 1 ;;
 esac
 
@@ -55,7 +56,7 @@ auth:
 masquerade:
   type: proxy
   proxy:
-    url: https://www.bing.com/
+    url: https://apps.apple.com/
     rewriteHost: true
 
 # 优化 UDP 传输
@@ -64,15 +65,15 @@ quic:
   maxStreamReceiveWindow: 8388608
 EOF
 
-# 6. 配置 iptables 端口转发 (你的代码)
+# 6. 配置 iptables 端口转发
 echo "[*] 配置端口跳跃 (50000:65535 -> $REAL_PORT)..."
 
-# 清理旧规则防止重复
+# 清理旧规则
 iptables -t nat -D PREROUTING -p udp --dport 50000:65535 -j DNAT --to-destination :$REAL_PORT 2>/dev/null || true
 # 添加新规则
 iptables -t nat -A PREROUTING -p udp --dport 50000:65535 -j DNAT --to-destination :$REAL_PORT
 
-# 尝试保存规则 (兼容不同系统)
+# 尝试保存规则
 if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save
 elif command -v service >/dev/null 2>&1; then
@@ -102,8 +103,7 @@ systemctl daemon-reload
 systemctl enable hysteria-server
 systemctl restart hysteria-server
 
-# 9. 配置防火墙
-# 注意：DNAT 后，INPUT 链看到的是 8899，所以放行 8899
+# 9. 配置防火墙 (放行内部端口和跳跃范围)
 if command -v ufw >/dev/null 2>&1; then
     ufw allow $REAL_PORT/udp
     ufw allow 50000:65535/udp
@@ -113,31 +113,40 @@ else
     iptables -I INPUT -p udp --dport 50000:65535 -j ACCEPT
 fi
 
-# 10. 输出链接 (随机挑一个端口 55555 生成链接)
+# 10. 获取 IP 和 地区信息
+echo "[*] 正在识别服务器地区..."
 IP=$(curl -s --max-time 3 ifconfig.me || hostname -I | awk '{print $1}')
+
+# 使用 ip-api 获取中文地区信息 (格式：国家\n城市)
+LOC_INFO=$(curl -s --max-time 5 "http://ip-api.com/line?lang=zh-CN&fields=country,city")
+
+if [[ -n "$LOC_INFO" ]]; then
+    COUNTRY=$(echo "$LOC_INFO" | sed -n '1p')
+    CITY=$(echo "$LOC_INFO" | sed -n '2p')
+    # 组合备注，例如：美国：洛杉矶
+    REMARK="${COUNTRY}：${CITY}"
+else
+    # 如果查询失败，使用默认备注
+    REMARK="Hysteria2-Hopping"
+fi
+
 HOP_PORT=55555
-SHARE_LINK="hysteria2://$PASSWORD@$IP:$HOP_PORT/?sni=www.bing.com&insecure=1#Aliyun-Hopping"
+# 生成链接 (SNI 已改为 apps.apple.com)
+SHARE_LINK="hysteria2://$PASSWORD@$IP:$HOP_PORT/?sni=apps.apple.com&insecure=1#$REMARK"
 
 echo ""
 echo "========================================================"
-echo "    安装完成！端口跳跃版"
+echo "    安装完成！端口跳跃版 (Apple 伪装)"
 echo "========================================================"
-echo "IP: $IP"
-echo "密码: $PASSWORD"
-echo "协议: Hysteria 2 (UDP)"
-echo "端口跳跃范围: 50000 - 65535"
+echo "IP 地址: $IP"
+echo "地区位置: $REMARK"
+echo "端口范围: 50000 - 65535"
 echo "--------------------------------------------------------"
-echo "小火箭专用链接 (默认填了 55555 端口)："
+echo "小火箭专用链接 (已包含地区备注)："
 echo ""
 echo "$SHARE_LINK"
 echo ""
 echo "--------------------------------------------------------"
-echo "【极度重要】阿里云安全组设置"
-echo "请去阿里云后台 -> 安全组 -> 添加入方向规则："
-echo "协议: UDP"
-echo "端口范围: 50000/65535"
-echo "源IP: 0.0.0.0/0"
-echo "--------------------------------------------------------"
-echo "如果 55555 端口不通，你在小火箭里把端口改成 50000-65535"
-echo "之间的任意数字都能连！"
+echo "【GCP/阿里云 设置提醒】"
+echo "请务必去网页后台防火墙放行 UDP 协议，端口 50000-65535"
 echo "========================================================"
