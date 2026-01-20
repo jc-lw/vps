@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ====================================================
-# Hysteria 2 端口跳跃版 (Apple伪装 + 精准中文地区)
+# Hysteria 2 端口跳跃版 (Apple伪装 + 州级定位 + HY2后缀)
 # 监听端口: 8899 (内部)
 # 公网端口: 50000-65535 (外部任选)
 # ====================================================
@@ -15,7 +15,7 @@ echo "nameserver 8.8.8.8" > /etc/resolv.conf
 echo "nameserver 1.1.1.1" >> /etc/resolv.conf
 
 echo "========================================================"
-echo "    正在部署 Hysteria 2 (Apple伪装 + 中文地区)..."
+echo "    正在部署 Hysteria 2 (Apple伪装 + 地区HY2)..."
 echo "========================================================"
 
 # 2. 准备目录
@@ -108,19 +108,19 @@ else
     iptables -I INPUT -p udp --dport 50000:65535 -j ACCEPT
 fi
 
-# 10. 获取 IP 和 地区信息 (优化版)
+# 10. 获取 IP 和 地区信息 (加后缀版)
 echo "[*] 正在识别服务器地区..."
 IP=$(curl -s --max-time 3 ifconfig.me || hostname -I | awk '{print $1}')
 
-# 修改：获取 regionName (省/州) 而不是 city (城市)
-# 这样能确保获得 "俄勒冈"、"加利福尼亚" 等准确翻译
+# 使用 regionName 获取 "州/省" 级别
 LOC_INFO=$(curl -s --max-time 5 "http://ip-api.com/line?lang=zh-CN&fields=country,regionName")
 
 if [[ -n "$LOC_INFO" ]]; then
     COUNTRY=$(echo "$LOC_INFO" | sed -n '1p')
     REGION=$(echo "$LOC_INFO" | sed -n '2p')
-    # 组合备注，例如：美国：俄勒冈
-    REMARK="${COUNTRY}：${REGION}"
+    
+    # 【这里修改了】在最后加上 HY2
+    REMARK="${COUNTRY}：${REGION} HY2"
 else
     REMARK="Hysteria2-Hopping"
 fi
@@ -133,7 +133,7 @@ echo "========================================================"
 echo "    安装完成！端口跳跃版 (Apple 伪装)"
 echo "========================================================"
 echo "IP 地址: $IP"
-echo "地区位置: $REMARK"
+echo "地区备注: $REMARK"
 echo "端口范围: 50000 - 65535"
 echo "--------------------------------------------------------"
 echo "小火箭专用链接："
