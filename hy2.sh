@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ====================================================
-# Hysteria 2 端口跳跃版 (自动识别地区 + Apple伪装)
+# Hysteria 2 端口跳跃版 (Apple伪装 + 精准中文地区)
 # 监听端口: 8899 (内部)
 # 公网端口: 50000-65535 (外部任选)
 # ====================================================
@@ -9,13 +9,13 @@
 # 0. 检查 Root
 if [[ $EUID -ne 0 ]]; then echo "必须 root 运行"; exit 1; fi
 
-# 1. 修复 DNS (防止 API 查询失败)
+# 1. 修复 DNS
 chattr -i /etc/resolv.conf >/dev/null 2>&1
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 echo "nameserver 1.1.1.1" >> /etc/resolv.conf
 
 echo "========================================================"
-echo "    正在部署 Hysteria 2 (Apple伪装 + 自动地区)..."
+echo "    正在部署 Hysteria 2 (Apple伪装 + 中文地区)..."
 echo "========================================================"
 
 # 2. 准备目录
@@ -23,8 +23,8 @@ mkdir -p /etc/hysteria
 cd /etc/hysteria
 rm -f server.crt server.key config.yaml
 
-# 3. 生成自签名证书 (修改为 apps.apple.com)
-echo "[*] 生成伪装证书 (apps.apple.com)..."
+# 3. 生成自签名证书 (apps.apple.com)
+echo "[*] 生成伪装证书..."
 openssl req -x509 -nodes -newkey rsa:2048 -keyout server.key -out server.crt -days 3650 -subj "/CN=apps.apple.com"
 
 # 4. 下载核心
@@ -40,7 +40,7 @@ chmod +x /usr/local/bin/hysteria
 
 # 5. 生成配置文件 (监听 8899)
 PASSWORD=$(date +%s%N | md5sum | head -c 16)
-REAL_PORT=8899  # 内部实际监听端口
+REAL_PORT=8899
 
 cat > config.yaml <<EOF
 listen: :$REAL_PORT
@@ -59,7 +59,6 @@ masquerade:
     url: https://apps.apple.com/
     rewriteHost: true
 
-# 优化 UDP 传输
 quic:
   initStreamReceiveWindow: 8388608
   maxStreamReceiveWindow: 8388608
@@ -67,13 +66,9 @@ EOF
 
 # 6. 配置 iptables 端口转发
 echo "[*] 配置端口跳跃 (50000:65535 -> $REAL_PORT)..."
-
-# 清理旧规则
 iptables -t nat -D PREROUTING -p udp --dport 50000:65535 -j DNAT --to-destination :$REAL_PORT 2>/dev/null || true
-# 添加新规则
 iptables -t nat -A PREROUTING -p udp --dport 50000:65535 -j DNAT --to-destination :$REAL_PORT
 
-# 尝试保存规则
 if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save
 elif command -v service >/dev/null 2>&1; then
@@ -103,7 +98,7 @@ systemctl daemon-reload
 systemctl enable hysteria-server
 systemctl restart hysteria-server
 
-# 9. 配置防火墙 (放行内部端口和跳跃范围)
+# 9. 配置防火墙
 if command -v ufw >/dev/null 2>&1; then
     ufw allow $REAL_PORT/udp
     ufw allow 50000:65535/udp
@@ -113,25 +108,24 @@ else
     iptables -I INPUT -p udp --dport 50000:65535 -j ACCEPT
 fi
 
-# 10. 获取 IP 和 地区信息
+# 10. 获取 IP 和 地区信息 (优化版)
 echo "[*] 正在识别服务器地区..."
 IP=$(curl -s --max-time 3 ifconfig.me || hostname -I | awk '{print $1}')
 
-# 使用 ip-api 获取中文地区信息 (格式：国家\n城市)
-LOC_INFO=$(curl -s --max-time 5 "http://ip-api.com/line?lang=zh-CN&fields=country,city")
+# 修改：获取 regionName (省/州) 而不是 city (城市)
+# 这样能确保获得 "俄勒冈"、"加利福尼亚" 等准确翻译
+LOC_INFO=$(curl -s --max-time 5 "http://ip-api.com/line?lang=zh-CN&fields=country,regionName")
 
 if [[ -n "$LOC_INFO" ]]; then
     COUNTRY=$(echo "$LOC_INFO" | sed -n '1p')
-    CITY=$(echo "$LOC_INFO" | sed -n '2p')
-    # 组合备注，例如：美国：洛杉矶
-    REMARK="${COUNTRY}：${CITY}"
+    REGION=$(echo "$LOC_INFO" | sed -n '2p')
+    # 组合备注，例如：美国：俄勒冈
+    REMARK="${COUNTRY}：${REGION}"
 else
-    # 如果查询失败，使用默认备注
     REMARK="Hysteria2-Hopping"
 fi
 
 HOP_PORT=55555
-# 生成链接 (SNI 已改为 apps.apple.com)
 SHARE_LINK="hysteria2://$PASSWORD@$IP:$HOP_PORT/?sni=apps.apple.com&insecure=1#$REMARK"
 
 echo ""
@@ -142,11 +136,11 @@ echo "IP 地址: $IP"
 echo "地区位置: $REMARK"
 echo "端口范围: 50000 - 65535"
 echo "--------------------------------------------------------"
-echo "小火箭专用链接 (已包含地区备注)："
+echo "小火箭专用链接："
 echo ""
 echo "$SHARE_LINK"
 echo ""
 echo "--------------------------------------------------------"
-echo "【GCP/阿里云 设置提醒】"
-echo "请务必去网页后台防火墙放行 UDP 协议，端口 50000-65535"
+echo "【GCP 设置提醒】"
+echo "请务必去 GCP 防火墙放行 UDP 协议，端口 50000-65535"
 echo "========================================================"
