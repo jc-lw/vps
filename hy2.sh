@@ -1,18 +1,19 @@
 #!/bin/bash
 
 # ====================================================
-# Hysteria 2 纯净极简版
+# Hysteria 2 纯净极简版 (路径修复完美版)
 # 特性：
 # 1. 不安装任何防火墙组件 (如你所愿)
 # 2. 保留密码记忆 (升级不换密码)
 # 3. 智能 IPv4 优先 + 无限速
+# 4. 修复 Systemd 找不到配置文件的致命 Bug
 # ====================================================
 
 # 0. 检查 Root
 if [[ $EUID -ne 0 ]]; then echo "必须 root 运行"; exit 1; fi
 
 echo "========================================================"
-echo "    正在部署 Hysteria 2 (纯净版)..."
+echo "    正在部署 Hysteria 2 (纯净版 - 修复路径问题)..."
 echo "========================================================"
 
 # 1. 智能网络检测 (IPv4 优先)
@@ -36,6 +37,7 @@ fi
 mkdir -p /etc/hysteria
 
 # 3. 密码记忆逻辑
+# 【关键修复】明确指定从 /etc/hysteria 读取旧配置
 CONFIG_FILE="/etc/hysteria/config.yaml"
 OLD_PASSWORD=""
 
@@ -64,11 +66,13 @@ case $ARCH in
     aarch64) URL="https://ghfast.top/https://github.com/apernet/hysteria/releases/download/app%2Fv2.2.4/hysteria-linux-arm64" ;;
     *)       echo "不支持的架构: $ARCH"; exit 1 ;;
 esac
+# 只有文件不存在时才下载，或者强制覆盖，这里为了稳妥加了 -O
 wget -qO /usr/local/bin/hysteria "$URL" && chmod +x /usr/local/bin/hysteria
 
 # 6. 写入配置
 REAL_PORT=8899
-cat > config.yaml <<EOF
+# 【关键修复】必须写入到 /etc/hysteria/config.yaml，而不是当前目录
+cat > /etc/hysteria/config.yaml <<EOF
 listen: :$REAL_PORT
 
 tls:
@@ -99,10 +103,13 @@ EOF
 
 # 7. 配置端口转发 (这行必须有，否则端口跳跃不生效)
 # 这不是防火墙规则，这是路由规则
+echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-forwarding.conf
+sysctl -p >/dev/null 2>&1
 iptables -t nat -D PREROUTING -p udp --dport 50000:65535 -j DNAT --to-destination :$REAL_PORT 2>/dev/null || true
 iptables -t nat -A PREROUTING -p udp --dport 50000:65535 -j DNAT --to-destination :$REAL_PORT
 
 # 8. 系统服务
+# 【关键修复】ExecStart 使用绝对路径，确保 systemd 肯定能找到配置
 cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
 Description=Hysteria 2 Server
@@ -112,7 +119,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/etc/hysteria
-ExecStart=/usr/local/bin/hysteria server -c config.yaml
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
 Restart=always
 LimitNOFILE=65536
 
@@ -141,7 +148,7 @@ SHARE_LINK="hysteria2://$PASSWORD@$IP:$HOP_PORT/?sni=apps.apple.com&insecure=1#$
 
 echo ""
 echo "========================================================"
-echo "    安装完成！(纯净极简版)"
+echo "    安装完成！(纯净极简版 - 已修复启动路径)"
 echo "========================================================"
 echo "IP 地址: $IP"
 echo "地区备注: $REMARK"
