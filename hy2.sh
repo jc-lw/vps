@@ -1,19 +1,19 @@
 #!/bin/bash
 
 # ====================================================
-# Hysteria 2 纯净极简版 (路径修复完美版)
+# Hysteria 2 纯净极简版 (固定密码版)
 # 特性：
-# 1. 不安装任何防火墙组件 (如你所愿)
-# 2. 保留密码记忆 (升级不换密码)
+# 1. 不安装任何防火墙组件
+# 2. 强制使用固定密码: e3a5bb40be52de65
 # 3. 智能 IPv4 优先 + 无限速
-# 4. 修复 Systemd 找不到配置文件的致命 Bug
+# 4. 修复 Systemd 路径
 # ====================================================
 
 # 0. 检查 Root
 if [[ $EUID -ne 0 ]]; then echo "必须 root 运行"; exit 1; fi
 
 echo "========================================================"
-echo "    正在部署 Hysteria 2 (纯净版 - 修复路径问题)..."
+echo "    正在部署 Hysteria 2 (固定密码版)..."
 echo "========================================================"
 
 # 1. 智能网络检测 (IPv4 优先)
@@ -36,23 +36,9 @@ fi
 # 2. 准备目录
 mkdir -p /etc/hysteria
 
-# 3. 密码记忆逻辑
-# 【关键修复】明确指定从 /etc/hysteria 读取旧配置
-CONFIG_FILE="/etc/hysteria/config.yaml"
-OLD_PASSWORD=""
-
-if [[ -f "$CONFIG_FILE" ]]; then
-    # 尝试读取旧密码
-    OLD_PASSWORD=$(grep 'password:' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"')
-fi
-
-if [[ -n "$OLD_PASSWORD" ]]; then
-    echo "[*] 保留当前密码: $OLD_PASSWORD"
-    PASSWORD="$OLD_PASSWORD"
-else
-    echo "[*] 生成新密码..."
-    PASSWORD=$(date +%s%N | md5sum | head -c 16)
-fi
+# 3. 密码设定 (已修改为固定密码)
+PASSWORD="e3a5bb40be52de65"
+echo "[*] 使用固定密码: $PASSWORD"
 
 # 4. 证书处理
 if [[ ! -f "/etc/hysteria/server.key" ]]; then
@@ -71,7 +57,7 @@ wget -qO /usr/local/bin/hysteria "$URL" && chmod +x /usr/local/bin/hysteria
 
 # 6. 写入配置
 REAL_PORT=8899
-# 【关键修复】必须写入到 /etc/hysteria/config.yaml，而不是当前目录
+# 【关键修复】必须写入到 /etc/hysteria/config.yaml
 cat > /etc/hysteria/config.yaml <<EOF
 listen: :$REAL_PORT
 
@@ -101,15 +87,15 @@ quic:
   maxConnReceiveWindow: 33554432
 EOF
 
-# 7. 配置端口转发 (这行必须有，否则端口跳跃不生效)
-# 这不是防火墙规则，这是路由规则
+# 7. 配置端口转发 (范围 50000:65535)
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-forwarding.conf
 sysctl -p >/dev/null 2>&1
+
+# 清理旧规则并添加新规则
 iptables -t nat -D PREROUTING -p udp --dport 50000:65535 -j DNAT --to-destination :$REAL_PORT 2>/dev/null || true
 iptables -t nat -A PREROUTING -p udp --dport 50000:65535 -j DNAT --to-destination :$REAL_PORT
 
 # 8. 系统服务
-# 【关键修复】ExecStart 使用绝对路径，确保 systemd 肯定能找到配置
 cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
 Description=Hysteria 2 Server
@@ -148,15 +134,14 @@ SHARE_LINK="hysteria2://$PASSWORD@$IP:$HOP_PORT/?sni=apps.apple.com&insecure=1#$
 
 echo ""
 echo "========================================================"
-echo "    安装完成！(纯净极简版 - 已修复启动路径)"
+echo "    安装完成！(固定密码版)"
 echo "========================================================"
 echo "IP 地址: $IP"
 echo "地区备注: $REMARK"
-echo "当前密码: $PASSWORD"
+echo "固定密码: $PASSWORD"
 echo "--------------------------------------------------------"
-echo "此版本已去除防火墙持久化组件。"
-echo "注意：如果你重启了服务器，请重新运行此脚本，"
-echo "否则端口转发规则(50000-65535)可能会丢失。"
+echo "注意：此版本利用 iptables 转发，重启服务器后需重新运行脚本，"
+echo "或者手动保存 iptables 规则，否则端口转发将失效。"
 echo "--------------------------------------------------------"
 echo "小火箭专用链接："
 echo ""
