@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # ====================================================
 # Hysteria 2 终极版 (固定密码 + Clash 本地订阅服务)
@@ -7,37 +7,41 @@
 # 2. 修复端口跳跃 (50000:65535) 和依赖
 # 3. 自动生成 Clash Meta (mihomo) 兼容的完整 YAML
 # 4. 在 8080 端口运行本地 HTTP 订阅服务
+# 5. 支持系统: Ubuntu/Debian, CentOS/RHEL, Alpine Linux
 # ====================================================
 
 # 0. 检查 Root
-if [[ $EUID -ne 0 ]]; then echo "必须 root 运行"; exit 1; fi
+if [ "$(id -u)" != "0" ]; then echo "必须 root 运行"; exit 1; fi
 
 echo "========================================================"
 echo "    正在部署 Hysteria 2 (含 Clash 本地订阅服务)..."
 echo "========================================================"
 
-# 0.5 检查并安装依赖
-echo "[*] 检查系统环境 (iptables & python3)..."
-if command -v apt-get >/dev/null 2>&1; then
+# 0.5 检查并安装依赖 (兼容 apt, yum, apk)
+echo "[*] 检查系统环境 (iptables, python3, curl, openssl)..."
+if command -v apk >/dev/null 2>&1; then
+    apk update -q
+    apk add iptables python3 curl openssl wget -q
+elif command -v apt-get >/dev/null 2>&1; then
     apt-get update -y -qq
-    apt-get install -y iptables python3 curl -qq
+    apt-get install -y iptables python3 curl openssl wget -qq
 elif command -v yum >/dev/null 2>&1; then
-    yum install -y iptables python3 curl -q
+    yum install -y iptables python3 curl openssl wget -q
 fi
 
 # 1. 智能网络检测 (IPv4 优先)
-chattr -i /etc/resolv.conf >/dev/null 2>&1
+chattr -i /etc/resolv.conf >/dev/null 2>&1 || true
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 echo "nameserver 1.1.1.1" >> /etc/resolv.conf
 
 HAVE_V4=$(curl -s4m3 https://ip.sb -k | grep -q . && echo 1 || echo 0)
 HAVE_V6=$(curl -s6m3 https://ip.sb -k | grep -q . && echo 1 || echo 0)
 
-if [[ "$HAVE_V4" == "1" && "$HAVE_V6" == "1" ]]; then
+if [ "$HAVE_V4" = "1" ] && [ "$HAVE_V6" = "1" ]; then
     if grep -q "^precedence ::ffff:0:0/96  100" /etc/gai.conf 2>/dev/null; then
         : 
     else
-        echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+        echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf 2>/dev/null || true
         echo "[*] 已设置系统优先使用 IPv4 出口"
     fi
 fi
@@ -50,13 +54,17 @@ mkdir -p /etc/hysteria/www
 PASSWORD="e3a5bb40be52de65"
 
 # 4. 证书处理
-if [[ ! -f "/etc/hysteria/server.key" ]]; then
+if [ ! -f "/etc/hysteria/server.key" ]; then
     openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/hysteria/server.key -out /etc/hysteria/server.crt -days 3650 -subj "/CN=apps.apple.com" 2>/dev/null
 fi
 
 # 5. 下载核心 (防止 Text file busy)
 echo "[*] 正在停止旧服务释放文件锁定..."
-systemctl stop hysteria-server 2>/dev/null || true
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop hysteria-server 2>/dev/null || true
+elif command -v rc-service >/dev/null 2>&1; then
+    rc-service hysteria-server stop 2>/dev/null || true
+fi
 rm -f /usr/local/bin/hysteria
 
 ARCH=$(uname -m)
@@ -100,14 +108,17 @@ quic:
 EOF
 
 # 7. 配置端口转发 (端口跳跃 50000-65535)
+mkdir -p /etc/sysctl.d
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-forwarding.conf
-sysctl -p >/dev/null 2>&1
+sysctl -p /etc/sysctl.d/99-forwarding.conf >/dev/null 2>&1 || sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
 
 iptables -t nat -D PREROUTING -p udp --dport 50000:65535 -j DNAT --to-destination :$REAL_PORT 2>/dev/null || true
 iptables -t nat -A PREROUTING -p udp --dport 50000:65535 -j DNAT --to-destination :$REAL_PORT
 
-# 8. Hysteria 系统服务
-cat > /etc/systemd/system/hysteria-server.service <<EOF
+# 8. Hysteria 系统服务 (双系统兼容：systemd vs OpenRC)
+if command -v systemctl >/dev/null 2>&1; then
+    # Systemd 模式 (Ubuntu/Debian/CentOS)
+    cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
 Description=Hysteria 2 Server
 After=network.target
@@ -123,15 +134,31 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
-
-systemctl daemon-reload
-systemctl enable hysteria-server >/dev/null 2>&1
-systemctl restart hysteria-server
+    systemctl daemon-reload
+    systemctl enable hysteria-server >/dev/null 2>&1
+    systemctl restart hysteria-server
+elif command -v rc-update >/dev/null 2>&1; then
+    # OpenRC 模式 (Alpine Linux)
+    cat > /etc/init.d/hysteria-server <<EOF
+#!/sbin/openrc-run
+name="hysteria-server"
+command="/usr/local/bin/hysteria"
+command_args="server -c /etc/hysteria/config.yaml"
+command_background=true
+pidfile="/var/run/hysteria-server.pid"
+depend() {
+    need net
+}
+EOF
+    chmod +x /etc/init.d/hysteria-server
+    rc-update add hysteria-server default >/dev/null 2>&1
+    rc-service hysteria-server restart >/dev/null 2>&1
+fi
 
 # 9. 识别服务器信息并准备变量
 IP=$(curl -s4m3 ifconfig.me || curl -s6m3 ifconfig.me)
 LOC_INFO=$(curl -s --max-time 5 "http://ip-api.com/line/$IP?lang=zh-CN&fields=country,regionName")
-if [[ -n "$LOC_INFO" ]]; then
+if [ -n "$LOC_INFO" ]; then
     COUNTRY=$(echo "$LOC_INFO" | sed -n '1p')
     REGION=$(echo "$LOC_INFO" | sed -n '2p')
     REMARK="${COUNTRY}：${REGION} HY2"
@@ -179,8 +206,10 @@ rules:
   - MATCH,PROXY
 EOF
 
-# 配置 HTTP 服务的 systemd 守护进程
-cat > /etc/systemd/system/hy2-sub.service <<EOF
+# 配置 HTTP 服务的守护进程 (双系统兼容)
+if command -v systemctl >/dev/null 2>&1; then
+    # Systemd 模式
+    cat > /etc/systemd/system/hy2-sub.service <<EOF
 [Unit]
 Description=Hysteria 2 Local Sub Server
 After=network.target
@@ -195,13 +224,34 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
+    systemctl daemon-reload
+    systemctl enable hy2-sub >/dev/null 2>&1
+    systemctl restart hy2-sub
+    
+    HY2_STATUS=$(systemctl is-active hysteria-server)
+    SUB_STATUS=$(systemctl is-active hy2-sub)
+elif command -v rc-update >/dev/null 2>&1; then
+    # OpenRC 模式 (Alpine Linux)
+    cat > /etc/init.d/hy2-sub <<EOF
+#!/sbin/openrc-run
+name="hy2-sub"
+command="/usr/bin/python3"
+command_args="-m http.server $SUB_PORT"
+command_background=true
+pidfile="/var/run/hy2-sub.pid"
+directory="$SUB_DIR"
+depend() {
+    need net
+}
+EOF
+    chmod +x /etc/init.d/hy2-sub
+    rc-update add hy2-sub default >/dev/null 2>&1
+    rc-service hy2-sub restart >/dev/null 2>&1
 
-systemctl daemon-reload
-systemctl enable hy2-sub >/dev/null 2>&1
-systemctl restart hy2-sub
-
-# 检查订阅服务状态
-SUB_STATUS=$(systemctl is-active hy2-sub)
+    # 获取 OpenRC 服务状态
+    rc-service hysteria-server status 2>/dev/null | grep -q "started" && HY2_STATUS="active" || HY2_STATUS="inactive"
+    rc-service hy2-sub status 2>/dev/null | grep -q "started" && SUB_STATUS="active" || SUB_STATUS="inactive"
+fi
 
 # 11. 最终输出
 SHARE_LINK="hysteria2://$PASSWORD@$IP:$HOP_PORT/?sni=apps.apple.com&insecure=1#$REMARK"
@@ -215,7 +265,7 @@ echo "地区备注: $REMARK"
 echo "节点端口: $HOP_PORT (跳跃范围 50000-65535)"
 echo "固定密码: $PASSWORD"
 echo "--------------------------------------------------------"
-echo "Hysteria 2 运行状态    : $(systemctl is-active hysteria-server)"
+echo "Hysteria 2 运行状态    : $HY2_STATUS"
 echo "本地订阅服务状态       : $SUB_STATUS"
 echo "========================================================"
 echo -e "👉 \033[33mClash 本地订阅链接 (适用于 Clash Meta):\033[0m"
