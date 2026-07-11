@@ -4,7 +4,7 @@ set -e
 #================================================================================
 # 常量和全局变量
 #================================================================================
-VERSION="1.2.0-alice-auto"
+VERSION="1.3.0-tw-ipv4-relay"
 SCRIPT_URL="https://raw.githubusercontent.com/hkfires/onekey-tun2socks/main/onekey-tun2socks.sh"
 
 # 颜色定义
@@ -46,6 +46,14 @@ ALICE_SPEED_HOST="speed.cloudflare.com"
 ALICE_SPEED_URL="https://speed.cloudflare.com/__down?bytes=${ALICE_SPEED_BYTES}"
 ALICE_MONITOR_SCRIPT="/usr/local/sbin/alice-port-monitor"
 ALICE_MONITOR_SERVICE="/etc/systemd/system/alice-port-monitor.service"
+ALICE_EXPECTED_LOC="TW"
+ALICE_TUN_IPV4="198.18.0.1"
+RELAY_SOCKS_SERVICE="microsocks.service"
+RELAY_SOCKS_BINARY="/usr/local/bin/microsocks"
+RELAY_SOCKS_LISTEN="0.0.0.0"
+RELAY_SOCKS_PORT="3333"
+RELAY_SOCKS_OVERRIDE_DIR="/etc/systemd/system/microsocks.service.d"
+RELAY_SOCKS_OVERRIDE_FILE="/etc/systemd/system/microsocks.service.d/10-tun2socks-ipv4.conf"
 
 #================================================================================
 # 日志和工具函数
@@ -288,21 +296,23 @@ alice_proxy_url() {
 
 alice_check_port_ipv4() {
     local port="$1"
-    local total_time
+    local result ip loc
 
-    total_time=$(curl \
+    result=$(curl \
         --silent \
         --show-error \
         --fail \
-        --output /dev/null \
         --connect-timeout "$ALICE_CONNECT_TIMEOUT" \
         --max-time "$ALICE_HEALTH_TIMEOUT" \
         --proxy "$(alice_proxy_url "$port")" \
         --proxy-user "${ALICE_SOCKS_USERNAME}:${ALICE_SOCKS_PASSWORD}" \
-        --write-out '%{time_total}' \
         "$ALICE_HEALTH_URL" 2>/dev/null) || return 1
 
-    awk -v value="$total_time" 'BEGIN { exit !(value > 0) }'
+    ip=$(printf '%s\n' "$result" | sed -n 's/^ip=//p' | head -n 1)
+    loc=$(printf '%s\n' "$result" | sed -n 's/^loc=//p' | head -n 1)
+
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    [ "$loc" = "$ALICE_EXPECTED_LOC" ] || return 1
 }
 
 resolve_alice_speed_ipv4() {
@@ -312,22 +322,32 @@ resolve_alice_speed_ipv4() {
 benchmark_alice_port() {
     local port="$1"
     local speed_ipv4="$2"
-    local health_time speed_download speed_time
+    local health_result health_body health_time health_ip health_loc
+    local speed_download speed_time
 
-    health_time=$(curl \
+    health_result=$(curl \
         --silent \
         --show-error \
         --fail \
-        --output /dev/null \
         --connect-timeout "$ALICE_CONNECT_TIMEOUT" \
         --max-time "$ALICE_HEALTH_TIMEOUT" \
         --proxy "$(alice_proxy_url "$port")" \
         --proxy-user "${ALICE_SOCKS_USERNAME}:${ALICE_SOCKS_PASSWORD}" \
-        --write-out '%{time_total}' \
+        --write-out $'\n__TIME__:%{time_total}\n' \
         "$ALICE_HEALTH_URL" 2>/dev/null) || {
-            printf '%s|down|0|0\n' "$port"
+            printf '%s|down|0|0|-|-\n' "$port"
             return 0
         }
+
+    health_time=$(printf '%s\n' "$health_result" | sed -n 's/^__TIME__://p' | tail -n 1)
+    health_body=$(printf '%s\n' "$health_result" | sed '/^__TIME__:/d')
+    health_ip=$(printf '%s\n' "$health_body" | sed -n 's/^ip=//p' | head -n 1)
+    health_loc=$(printf '%s\n' "$health_body" | sed -n 's/^loc=//p' | head -n 1)
+
+    if ! [[ "$health_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || [ "$health_loc" != "$ALICE_EXPECTED_LOC" ]; then
+        printf '%s|wrong_exit|0|%s|%s|%s\n' "$port" "${health_time:-0}" "${health_ip:--}" "${health_loc:--}"
+        return 0
+    fi
 
     speed_download=0
     speed_time="$health_time"
@@ -351,7 +371,6 @@ benchmark_alice_port() {
         speed_time="${speed_result#*|}"
     fi
 
-    # 速度测试失败时仍可按 IPv4 响应延迟作为后备评分。
     if ! awk -v value="$speed_download" 'BEGIN { exit !(value > 0) }'; then
         speed_download=$(awk -v latency="$health_time" 'BEGIN {
             if (latency <= 0) print 1;
@@ -359,19 +378,19 @@ benchmark_alice_port() {
         }')
     fi
 
-    printf '%s|up|%s|%s\n' "$port" "$speed_download" "$speed_time"
+    printf '%s|up|%s|%s|%s|%s\n' "$port" "$speed_download" "$speed_time" "$health_ip" "$health_loc"
 }
 
 select_fastest_alice_port() {
-    local tmpdir speed_ipv4 port result status score elapsed
-    local best_port="" best_score="-1" best_elapsed="0"
+    local tmpdir speed_ipv4 port result status score elapsed exit_ip exit_loc
+    local best_port="" best_score="-1" best_elapsed="0" best_ip=""
 
     tmpdir=$(mktemp -d /tmp/alice-port-test.XXXXXX)
     speed_ipv4=$(resolve_alice_speed_ipv4 || true)
 
     echo >&2
     echo -e "${YELLOW}=========================================================${NC}" >&2
-    echo -e "${GREEN}正在并发测试 Alice 台湾家宽 10001-10008，出口目标强制使用 IPv4。${NC}" >&2
+    echo -e "${GREEN}正在并发测试 Alice 10001-10008，仅接受 loc=TW 的 IPv4 出口。${NC}" >&2
     echo -e "${YELLOW}=========================================================${NC}" >&2
 
     for port in $(seq "$ALICE_PORT_START" "$ALICE_PORT_END"); do
@@ -388,8 +407,12 @@ select_fastest_alice_port() {
         fi
 
         result=$(cat "$tmpdir/$port.result")
-        IFS='|' read -r port status score elapsed <<<"$result"
+        IFS='|' read -r port status score elapsed exit_ip exit_loc <<<"$result"
 
+        if [ "$status" = "wrong_exit" ]; then
+            warning "端口 $port：出口不合格，IP=${exit_ip}，地区=${exit_loc}（要求 IPv4/TW）" >&2
+            continue
+        fi
         if [ "$status" != "up" ]; then
             warning "端口 $port：不可用" >&2
             continue
@@ -397,12 +420,13 @@ select_fastest_alice_port() {
 
         local speed_mbps
         speed_mbps=$(awk -v value="$score" 'BEGIN { printf "%.2f", value * 8 / 1000000 }')
-        info "端口 $port：可用，测速 ${speed_mbps} Mbps，耗时 ${elapsed}s" >&2
+        info "端口 $port：IP=${exit_ip}，地区=${exit_loc}，测速 ${speed_mbps} Mbps，耗时 ${elapsed}s" >&2
 
         if awk -v current="$score" -v best="$best_score" 'BEGIN { exit !(current > best) }'; then
             best_port="$port"
             best_score="$score"
             best_elapsed="$elapsed"
+            best_ip="$exit_ip"
         fi
     done
 
@@ -415,12 +439,12 @@ select_fastest_alice_port() {
 
     local best_mbps
     best_mbps=$(awk -v value="$best_score" 'BEGIN { printf "%.2f", value * 8 / 1000000 }')
-    success "已选择最快端口 $best_port（约 ${best_mbps} Mbps，耗时 ${best_elapsed}s）。" >&2
+    success "已选择最快端口 $best_port（台湾 IPv4 ${best_ip}，约 ${best_mbps} Mbps，耗时 ${best_elapsed}s）。" >&2
     printf '%s\n' "$best_port"
 }
 
 write_alice_monitor() {
-    step "创建 Alice 端口自动检测守护程序..."
+    step "创建 Alice 台湾 IPv4 端口自动检测守护程序..."
 
     cat > "$ALICE_MONITOR_SCRIPT" <<EOF
 #!/bin/bash
@@ -431,13 +455,13 @@ TUN_SERVICE="tun2socks.service"
 SOCKS_ADDRESS="$ALICE_SOCKS_ADDRESS"
 SOCKS_USERNAME="$ALICE_SOCKS_USERNAME"
 SOCKS_PASSWORD="$ALICE_SOCKS_PASSWORD"
+EXPECTED_LOC="$ALICE_EXPECTED_LOC"
 PORT_START=$ALICE_PORT_START
 PORT_END=$ALICE_PORT_END
 CHECK_INTERVAL=$ALICE_MONITOR_INTERVAL
 CONNECT_TIMEOUT=$ALICE_CONNECT_TIMEOUT
 HEALTH_TIMEOUT=$ALICE_HEALTH_TIMEOUT
 SPEED_TIMEOUT=$ALICE_SPEED_TIMEOUT
-SPEED_BYTES=$ALICE_SPEED_BYTES
 HEALTH_URL="$ALICE_HEALTH_URL"
 SPEED_HOST="$ALICE_SPEED_HOST"
 SPEED_URL="https://speed.cloudflare.com/__down?bytes=$ALICE_SPEED_BYTES"
@@ -465,18 +489,27 @@ read_current_port() {
     ' "\$CONFIG_FILE" 2>/dev/null
 }
 
+probe_port() {
+    local port="\$1" result ip loc
+    result=\$(curl \
+        --silent \
+        --show-error \
+        --fail \
+        --connect-timeout "\$CONNECT_TIMEOUT" \
+        --max-time "\$HEALTH_TIMEOUT" \
+        --proxy "\$(proxy_url "\$port")" \
+        --proxy-user "\${SOCKS_USERNAME}:\${SOCKS_PASSWORD}" \
+        "\$HEALTH_URL" 2>/dev/null) || return 1
+
+    ip=\$(printf '%s\n' "\$result" | sed -n 's/^ip=//p' | head -n 1)
+    loc=\$(printf '%s\n' "\$result" | sed -n 's/^loc=//p' | head -n 1)
+    [[ "\$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\$ ]] || return 1
+    [ "\$loc" = "\$EXPECTED_LOC" ] || return 1
+    printf '%s|%s\n' "\$ip" "\$loc"
+}
+
 check_port() {
-    local port="\$1"
-    curl \\
-        --silent \\
-        --show-error \\
-        --fail \\
-        --output /dev/null \\
-        --connect-timeout "\$CONNECT_TIMEOUT" \\
-        --max-time "\$HEALTH_TIMEOUT" \\
-        --proxy "\$(proxy_url "\$port")" \\
-        --proxy-user "\${SOCKS_USERNAME}:\${SOCKS_PASSWORD}" \\
-        "\$HEALTH_URL" >/dev/null 2>&1
+    probe_port "\$1" >/dev/null
 }
 
 resolve_speed_ipv4() {
@@ -484,40 +517,42 @@ resolve_speed_ipv4() {
 }
 
 benchmark_port() {
-    local port="\$1"
-    local speed_ipv4="\$2"
-    local health_time speed_download speed_time speed_result
+    local port="\$1" speed_ipv4="\$2"
+    local probe exit_ip exit_loc health_time speed_download speed_time speed_result
 
-    health_time=\$(curl \\
-        --silent \\
-        --show-error \\
-        --fail \\
-        --output /dev/null \\
-        --connect-timeout "\$CONNECT_TIMEOUT" \\
-        --max-time "\$HEALTH_TIMEOUT" \\
-        --proxy "\$(proxy_url "\$port")" \\
-        --proxy-user "\${SOCKS_USERNAME}:\${SOCKS_PASSWORD}" \\
-        --write-out '%{time_total}' \\
-        "\$HEALTH_URL" 2>/dev/null) || {
-            printf '%s|down|0|0\n' "\$port"
-            return 0
-        }
+    probe=\$(probe_port "\$port") || {
+        printf '%s|down|0|0|-|-\n' "\$port"
+        return 0
+    }
+    exit_ip="\${probe%%|*}"
+    exit_loc="\${probe#*|}"
+
+    health_time=\$(curl \
+        --silent \
+        --show-error \
+        --fail \
+        --output /dev/null \
+        --connect-timeout "\$CONNECT_TIMEOUT" \
+        --max-time "\$HEALTH_TIMEOUT" \
+        --proxy "\$(proxy_url "\$port")" \
+        --proxy-user "\${SOCKS_USERNAME}:\${SOCKS_PASSWORD}" \
+        --write-out '%{time_total}' \
+        "\$HEALTH_URL" 2>/dev/null) || health_time=0
 
     speed_download=0
     speed_time="\$health_time"
-
     if [ -n "\$speed_ipv4" ]; then
-        speed_result=\$(curl \\
-            --silent \\
-            --show-error \\
-            --fail \\
-            --output /dev/null \\
-            --connect-timeout "\$CONNECT_TIMEOUT" \\
-            --max-time "\$SPEED_TIMEOUT" \\
-            --proxy "\$(proxy_url "\$port")" \\
-            --proxy-user "\${SOCKS_USERNAME}:\${SOCKS_PASSWORD}" \\
-            --resolve "\${SPEED_HOST}:443:\${speed_ipv4}" \\
-            --write-out '%{speed_download}|%{time_total}' \\
+        speed_result=\$(curl \
+            --silent \
+            --show-error \
+            --fail \
+            --output /dev/null \
+            --connect-timeout "\$CONNECT_TIMEOUT" \
+            --max-time "\$SPEED_TIMEOUT" \
+            --proxy "\$(proxy_url "\$port")" \
+            --proxy-user "\${SOCKS_USERNAME}:\${SOCKS_PASSWORD}" \
+            --resolve "\${SPEED_HOST}:443:\${speed_ipv4}" \
+            --write-out '%{speed_download}|%{time_total}' \
             "\$SPEED_URL" 2>/dev/null) || speed_result="0|\$health_time"
         speed_download="\${speed_result%%|*}"
         speed_time="\${speed_result#*|}"
@@ -530,11 +565,11 @@ benchmark_port() {
         }')
     fi
 
-    printf '%s|up|%s|%s\n' "\$port" "\$speed_download" "\$speed_time"
+    printf '%s|up|%s|%s|%s|%s\n' "\$port" "\$speed_download" "\$speed_time" "\$exit_ip" "\$exit_loc"
 }
 
 select_fastest_port() {
-    local tmpdir speed_ipv4 port result status score elapsed
+    local tmpdir speed_ipv4 port result status score elapsed exit_ip exit_loc
     local best_port="" best_score="-1"
 
     tmpdir=\$(mktemp -d /tmp/alice-monitor-test.XXXXXX) || return 1
@@ -548,10 +583,10 @@ select_fastest_port() {
     for port in \$(seq "\$PORT_START" "\$PORT_END"); do
         [ -s "\$tmpdir/\$port.result" ] || continue
         result=\$(cat "\$tmpdir/\$port.result")
-        IFS='|' read -r port status score elapsed <<<"\$result"
+        IFS='|' read -r port status score elapsed exit_ip exit_loc <<<"\$result"
         [ "\$status" = "up" ] || continue
 
-        log "端口 \$port 可用，评分 \$score，耗时 \${elapsed}s"
+        log "端口 \$port：台湾 IPv4 \$exit_ip，评分 \$score，耗时 \${elapsed}s"
         if awk -v current="\$score" -v best="\$best_score" 'BEGIN { exit !(current > best) }'; then
             best_port="\$port"
             best_score="\$score"
@@ -564,10 +599,8 @@ select_fastest_port() {
 }
 
 update_config_port() {
-    local new_port="\$1"
-    local tmp
+    local new_port="\$1" tmp
     tmp=\$(mktemp "\${CONFIG_FILE}.XXXXXX") || return 1
-
     awk -v new_port="\$new_port" '
         BEGIN { in_socks = 0; changed = 0 }
         /^socks5:/ { in_socks = 1; print; next }
@@ -579,7 +612,6 @@ update_config_port() {
         rm -f "\$tmp"
         return 1
     }
-
     chmod --reference="\$CONFIG_FILE" "\$tmp" 2>/dev/null || true
     chown --reference="\$CONFIG_FILE" "\$tmp" 2>/dev/null || true
     mv -f "\$tmp" "\$CONFIG_FILE"
@@ -587,59 +619,50 @@ update_config_port() {
 
 stop_tunnel() {
     if systemctl is-active --quiet "\$TUN_SERVICE"; then
-        log "当前出口不可用，停止 tun2socks，暂停所有经 tun0 的连接。"
+        log "当前出口不再满足台湾 IPv4，停止 tun2socks，等待合格端口恢复。"
         systemctl stop "\$TUN_SERVICE" || true
     fi
 }
 
 start_with_port() {
-    local port="\$1"
+    local port="\$1" probe
     update_config_port "\$port" || {
         log "更新配置端口失败。"
         return 1
     }
-
     log "切换到端口 \$port 并启动 tun2socks。"
     systemctl start "\$TUN_SERVICE" || return 1
     sleep 2
-
-    if systemctl is-active --quiet "\$TUN_SERVICE" && check_port "\$port"; then
-        log "端口 \$port 已恢复，tun2socks 已连接。"
+    probe=\$(probe_port "\$port" || true)
+    if systemctl is-active --quiet "\$TUN_SERVICE" && [ -n "\$probe" ]; then
+        log "端口 \$port 已恢复，出口 \${probe%%|*} / \${probe#*|}。"
         return 0
     fi
-
     log "端口 \$port 启动后验证失败，重新进入等待状态。"
     systemctl stop "\$TUN_SERVICE" >/dev/null 2>&1 || true
     return 1
 }
 
-log "Alice 自动选路守护启动：端口范围 \${PORT_START}-\${PORT_END}，检测间隔 \${CHECK_INTERVAL} 秒，IPv4 出口测试。"
-
+log "Alice 守护启动：仅接受 TW + IPv4，端口 \${PORT_START}-\${PORT_END}，每 \${CHECK_INTERVAL} 秒检测。"
 while true; do
     current_port=\$(read_current_port || true)
-
     if valid_port "\$current_port" && systemctl is-active --quiet "\$TUN_SERVICE" && check_port "\$current_port"; then
         sleep "\$CHECK_INTERVAL"
         continue
     fi
-
     stop_tunnel
-
     while true; do
-        log "检测可用端口并选择当前最快出口..."
+        log "检测合格端口并选择当前最快台湾 IPv4 出口..."
         selected_port=\$(select_fastest_port || true)
-
         if valid_port "\$selected_port"; then
             if start_with_port "\$selected_port"; then
                 break
             fi
         else
-            log "10001-10008 全部不可用，保持断开；\${CHECK_INTERVAL} 秒后重试。"
+            log "10001-10008 没有合格的台湾 IPv4 出口，保持断开；\${CHECK_INTERVAL} 秒后重试。"
         fi
-
         sleep "\$CHECK_INTERVAL"
     done
-
 done
 EOF
 
@@ -647,7 +670,7 @@ EOF
 
     cat > "$ALICE_MONITOR_SERVICE" <<EOF
 [Unit]
-Description=Alice SOCKS5 Port Auto Selector and Health Monitor
+Description=Alice Taiwan IPv4 SOCKS5 Port Auto Selector
 After=network-online.target tun2socks.service
 Wants=network-online.target
 
@@ -726,6 +749,40 @@ select_akile_node() {
     done
 }
 
+ensure_ipv4_dns_preference() {
+    local gai_line="precedence ::ffff:0:0/96  100"
+    touch /etc/gai.conf
+    if ! grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' /etc/gai.conf; then
+        printf '\n# Prefer IPv4 for the downstream relay; the Alice upstream itself remains IPv6.\n%s\n' "$gai_line" >> /etc/gai.conf
+    fi
+}
+
+configure_microsocks_ipv4_guard() {
+    if [ ! -x "$RELAY_SOCKS_BINARY" ] || [ ! -f "/etc/systemd/system/$RELAY_SOCKS_SERVICE" ]; then
+        warning "未检测到现有 MicroSocks 服务，跳过 3333 下游 IPv4 防泄漏绑定。"
+        return 0
+    fi
+
+    step "将 MicroSocks 3333 的目标连接强制绑定到 tun0 IPv4 ($ALICE_TUN_IPV4)..."
+    mkdir -p "$RELAY_SOCKS_OVERRIDE_DIR"
+    cat > "$RELAY_SOCKS_OVERRIDE_FILE" <<EOF
+[Unit]
+After=network-online.target tun2socks.service
+Wants=network-online.target tun2socks.service
+
+[Service]
+ExecStart=
+ExecStart=$RELAY_SOCKS_BINARY -i $RELAY_SOCKS_LISTEN -p $RELAY_SOCKS_PORT -b $ALICE_TUN_IPV4
+EOF
+    systemctl daemon-reload
+    systemctl enable "$RELAY_SOCKS_SERVICE" >/dev/null 2>&1 || true
+    systemctl restart "$RELAY_SOCKS_SERVICE" || {
+        warning "MicroSocks 重启失败，请运行 journalctl -u $RELAY_SOCKS_SERVICE -n 100 查看。"
+        return 1
+    }
+    success "MicroSocks 已启用 IPv4 防泄漏：IPv6 目标会失败，不会走香港原生 IPv6。"
+}
+
 cleanup_ip_rules() {
     step "正在清理残留的 IP 规则和路由..."
 
@@ -754,6 +811,12 @@ cleanup_ip_rules() {
 uninstall_tun2socks() {
     step "正在停止并移除 Alice 自动选路守护服务..."
     remove_alice_monitor
+    if [ -f "$RELAY_SOCKS_OVERRIDE_FILE" ]; then
+        rm -f "$RELAY_SOCKS_OVERRIDE_FILE"
+        rmdir "$RELAY_SOCKS_OVERRIDE_DIR" 2>/dev/null || true
+        systemctl daemon-reload
+        systemctl restart "$RELAY_SOCKS_SERVICE" 2>/dev/null || true
+    fi
 
     cleanup_ip_rules
 
@@ -809,6 +872,7 @@ uninstall_tun2socks() {
 
 install_tun2socks() {
     cleanup_ip_rules
+    ensure_ipv4_dns_preference
 
     step "检查 tun2socks 服务当前状态 (准备安装)..."
     if systemctl is-active --quiet tun2socks.service; then
@@ -1045,6 +1109,8 @@ EOF
 
         step "启动 Alice 自动选路守护服务..."
         systemctl restart alice-port-monitor.service
+
+        configure_microsocks_ipv4_guard || true
     else
         remove_alice_monitor
         step "启动服务..."
