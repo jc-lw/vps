@@ -1,91 +1,119 @@
-#!/bin/sh
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# ====================================================
-# Hysteria 2 极简共存版 (固定密码 + 单端口 2328)
-# 特性：
-# 1. 绝对隔离：独立二进制文件、独立配置夹、独立进程名
-# 2. 与 v2bx / 面板环境完美共存，互不干扰
-# 3. 彻底移除端口跳跃，仅使用纯净 UDP 2328 端口
-# 4. 本地订阅服务运行在 8180 端口 (防 8080 冲突)
-# ====================================================
+# ============================================================
+# Hysteria 2 链式落地 + 自动故障切换
+#
+# 正常状态：客户端 -> 1号 HY2 -> 2号 SOCKS5:3333 -> 台湾家宽
+# 故障状态：2号 SOCKS5 不可用时，自动切换为 1号服务器本地 IPv4 出口
+# 恢复状态：每 60 秒检测一次，检测到 2号 SOCKS5 恢复后立即切回
+#
+# 注意：切换出口时会重启一次 hy2-custom，已有连接会短暂重连。
+# ============================================================
 
-# 0. 检查 Root
-if [ "$(id -u)" != "0" ]; then echo "必须 root 运行"; exit 1; fi
-
-echo "========================================================"
-echo "    正在部署 Hysteria 2 (v2bx 完美共存独立版)..."
-echo "========================================================"
-
-# 0.5 检查并安装依赖
-echo "[*] 检查系统环境 (python3, curl, openssl, wget)..."
-if command -v apk >/dev/null 2>&1; then
-    apk update -q
-    apk add python3 curl openssl wget -q
-elif command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y -qq
-    apt-get install -y python3 curl openssl wget -qq
-elif command -v yum >/dev/null 2>&1; then
-    yum install -y python3 curl openssl wget -q
-fi
-
-# 1. 智能网络检测 (IPv4 优先)
-chattr -i /etc/resolv.conf >/dev/null 2>&1 || true
-echo "nameserver 8.8.8.8" > /etc/resolv.conf
-echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-
-HAVE_V4=$(curl -s4m3 https://ip.sb -k | grep -q . && echo 1 || echo 0)
-HAVE_V6=$(curl -s6m3 https://ip.sb -k | grep -q . && echo 1 || echo 0)
-
-if [ "$HAVE_V4" = "1" ] && [ "$HAVE_V6" = "1" ]; then
-    if grep -q "^precedence ::ffff:0:0/96  100" /etc/gai.conf 2>/dev/null; then
-        : 
-    else
-        echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf 2>/dev/null || true
-    fi
-fi
-
-# 2. 准备沙盒目录 (全面改名为 hy2-custom)
-mkdir -p /etc/hy2-custom
-mkdir -p /etc/hy2-custom/www
-
-# 3. 密码与端口设定
+# -------------------- 可修改参数 --------------------
 PASSWORD="e3a5bb40be52de65"
-TARGET_PORT=2328
+TARGET_PORT="2328"
+RELAY_HOST="hk1.cebaoge.me"
+RELAY_PORT="3333"
+CHECK_INTERVAL="60"
+SUB_PORT="28180"
 
-# 4. 证书处理 (隔离目录)
-if [ ! -f "/etc/hy2-custom/server.key" ]; then
-    openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/hy2-custom/server.key -out /etc/hy2-custom/server.crt -days 3650 -subj "/CN=apps.apple.com" 2>/dev/null
+# 只在 2号 SOCKS5 的真实出口为台湾 IPv4 时使用它。
+# 设为 0 时只检查 SOCKS5 是否能正常访问外网。
+REQUIRE_TW="1"
+
+# 保持你原脚本使用的 Hysteria 版本，避免无意改变运行行为。
+HYSTERIA_VERSION="app/v2.2.4"
+# ----------------------------------------------------
+
+BASE_DIR="/etc/hy2-custom"
+WWW_DIR="${BASE_DIR}/www"
+CONFIG_FILE="${BASE_DIR}/config.yaml"
+ACL_FILE="${BASE_DIR}/active.acl"
+STATE_FILE="${BASE_DIR}/egress.mode"
+FAILOVER_ENV="${BASE_DIR}/failover.conf"
+BIN_PATH="/usr/local/bin/hy2-custom"
+CHECK_SCRIPT="/usr/local/sbin/hy2-relay-check"
+LOOP_SCRIPT="/usr/local/sbin/hy2-relay-monitor-loop"
+
+log() {
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+fatal() {
+    log "错误: $*"
+    exit 1
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+    fatal "必须使用 root 运行"
 fi
 
-# 5. 下载核心并重命名为 hy2-custom (防止覆盖 v2bx 的文件)
-echo "[*] 正在准备独立运行核心..."
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl stop hy2-custom 2>/dev/null || true
-elif command -v rc-service >/dev/null 2>&1; then
-    rc-service hy2-custom stop 2>/dev/null || true
-fi
-rm -f /usr/local/bin/hy2-custom
+install_dependencies() {
+    log "安装运行依赖..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            ca-certificates curl openssl wget python3 util-linux
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache ca-certificates curl openssl wget python3 util-linux
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y ca-certificates curl openssl wget python3 util-linux
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y ca-certificates curl openssl wget python3 util-linux
+    else
+        fatal "不支持的包管理器"
+    fi
+}
 
-ARCH=$(uname -m)
-case $ARCH in
-    x86_64)  URL="https://ghfast.top/https://github.com/apernet/hysteria/releases/download/app%2Fv2.2.4/hysteria-linux-amd64" ;;
-    aarch64) URL="https://ghfast.top/https://github.com/apernet/hysteria/releases/download/app%2Fv2.2.4/hysteria-linux-arm64" ;;
-    *)       echo "不支持的架构: $ARCH"; exit 1 ;;
-esac
+download_hysteria() {
+    local arch url version_path
+    arch="$(uname -m)"
+    version_path="${HYSTERIA_VERSION//\//%2F}"
 
-wget -qO /usr/local/bin/hy2-custom "$URL" && chmod +x /usr/local/bin/hy2-custom
+    case "$arch" in
+        x86_64|amd64)
+            url="https://ghfast.top/https://github.com/apernet/hysteria/releases/download/${version_path}/hysteria-linux-amd64"
+            ;;
+        aarch64|arm64)
+            url="https://ghfast.top/https://github.com/apernet/hysteria/releases/download/${version_path}/hysteria-linux-arm64"
+            ;;
+        *)
+            fatal "不支持的架构: $arch"
+            ;;
+    esac
 
-# 6. 写入独立配置
-cat > /etc/hy2-custom/config.yaml <<EOF
-listen: :$TARGET_PORT
+    log "下载 Hysteria ${HYSTERIA_VERSION}..."
+    rm -f "${BIN_PATH}.new"
+    wget -qO "${BIN_PATH}.new" "$url"
+    chmod 0755 "${BIN_PATH}.new"
+    mv -f "${BIN_PATH}.new" "$BIN_PATH"
+}
+
+prepare_files() {
+    mkdir -p "$BASE_DIR" "$WWW_DIR" /usr/local/sbin
+
+    if [ ! -s "${BASE_DIR}/server.key" ] || [ ! -s "${BASE_DIR}/server.crt" ]; then
+        log "生成自签名证书..."
+        openssl req -x509 -nodes -newkey rsa:2048 \
+            -keyout "${BASE_DIR}/server.key" \
+            -out "${BASE_DIR}/server.crt" \
+            -days 3650 \
+            -subj "/CN=apps.apple.com" >/dev/null 2>&1
+        chmod 0600 "${BASE_DIR}/server.key"
+    fi
+
+    cat > "$CONFIG_FILE" <<EOF_CONFIG
+listen: :${TARGET_PORT}
 
 tls:
-  cert: /etc/hy2-custom/server.crt
-  key: /etc/hy2-custom/server.key
+  cert: ${BASE_DIR}/server.crt
+  key: ${BASE_DIR}/server.key
 
 auth:
   type: password
-  password: "$PASSWORD"
+  password: "${PASSWORD}"
 
 bandwidth:
   up: 10 gbps
@@ -103,69 +131,327 @@ quic:
   maxStreamReceiveWindow: 16777216
   initConnReceiveWindow: 33554432
   maxConnReceiveWindow: 33554432
-EOF
 
-# 7. 注册独立系统服务 (Systemd / OpenRC 兼容)
-if command -v systemctl >/dev/null 2>&1; then
-    cat > /etc/systemd/system/hy2-custom.service <<EOF
+# 两个静态出站：监控程序只切换 ACL，不改主配置。
+outbounds:
+  - name: Server2_Relay
+    type: socks5
+    socks5:
+      addr: '${RELAY_HOST}:${RELAY_PORT}'
+
+  - name: Direct_Local
+    type: direct
+    direct:
+      mode: 4
+
+acl:
+  file: ${ACL_FILE}
+EOF_CONFIG
+
+    # 安装时先使用本地出口，随后由健康检查决定是否切换到 2号。
+    if [ ! -s "$ACL_FILE" ]; then
+        printf '%s\n' 'Direct_Local(all)' > "$ACL_FILE"
+    fi
+    if [ ! -s "$STATE_FILE" ]; then
+        printf '%s\n' 'direct' > "$STATE_FILE"
+    fi
+
+    cat > "$FAILOVER_ENV" <<EOF_ENV
+RELAY_HOST='${RELAY_HOST}'
+RELAY_PORT='${RELAY_PORT}'
+REQUIRE_TW='${REQUIRE_TW}'
+ACL_FILE='${ACL_FILE}'
+STATE_FILE='${STATE_FILE}'
+EOF_ENV
+    chmod 0600 "$FAILOVER_ENV"
+}
+
+write_check_script() {
+    cat > "$CHECK_SCRIPT" <<'EOF_CHECK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ENV_FILE="/etc/hy2-custom/failover.conf"
+[ -r "$ENV_FILE" ] || exit 1
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+
+LOCK_FILE="/run/hy2-relay-check.lock"
+exec 9>"$LOCK_FILE"
+flock -n 9 || exit 0
+
+log() {
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+restart_hy2() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart hy2-custom.service
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service hy2-custom restart
+    else
+        return 1
+    fi
+}
+
+hy2_is_active() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active --quiet hy2-custom.service
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service hy2-custom status >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+check_relay() {
+    local trace ip loc
+
+    # 使用真实 SOCKS5 请求，而不是仅检查 TCP 端口。
+    # 这样即使 3333 在监听，但 2号后端不能访问外网，也会判定为故障。
+    trace="$(curl -4 -kfsS \
+        --connect-timeout 4 \
+        --max-time 10 \
+        --proxy "socks5h://${RELAY_HOST}:${RELAY_PORT}" \
+        https://1.1.1.1/cdn-cgi/trace 2>/dev/null || true)"
+
+    ip="$(printf '%s\n' "$trace" | sed -n 's/^ip=//p' | head -n1)"
+    loc="$(printf '%s\n' "$trace" | sed -n 's/^loc=//p' | head -n1)"
+
+    # 必须取得 IPv4 地址。
+    case "$ip" in
+        *.*.*.*) ;;
+        *) return 1 ;;
+    esac
+
+    if [ "${REQUIRE_TW:-1}" = "1" ] && [ "$loc" != "TW" ]; then
+        return 1
+    fi
+
+    printf '%s|%s\n' "$ip" "$loc"
+    return 0
+}
+
+apply_mode() {
+    local desired="$1"
+    local detail="${2:-}"
+    local rule current tmp
+
+    case "$desired" in
+        relay)
+            rule='Server2_Relay(all)'
+            ;;
+        direct)
+            rule='Direct_Local(all)'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    current="$(cat "$STATE_FILE" 2>/dev/null || true)"
+
+    if [ "$current" = "$desired" ] && grep -Fxq "$rule" "$ACL_FILE" 2>/dev/null; then
+        if ! hy2_is_active; then
+            log "HY2 未运行，按 ${desired} 模式启动"
+            restart_hy2
+        fi
+        exit 0
+    fi
+
+    tmp="${ACL_FILE}.tmp.$$"
+    printf '%s\n' "$rule" > "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$ACL_FILE"
+    printf '%s\n' "$desired" > "$STATE_FILE"
+
+    if restart_hy2; then
+        if [ "$desired" = "relay" ]; then
+            log "已切换到 2号 SOCKS5 出口 ${RELAY_HOST}:${RELAY_PORT} (${detail})"
+        else
+            log "2号 SOCKS5 不可用，已切换到 1号本地 IPv4 出口"
+        fi
+        exit 0
+    fi
+
+    # 如果切到中转模式时重启失败，自动回滚为本地直连。
+    if [ "$desired" = "relay" ]; then
+        log "切换中转模式失败，回滚本地出口"
+        printf '%s\n' 'Direct_Local(all)' > "$ACL_FILE"
+        printf '%s\n' 'direct' > "$STATE_FILE"
+        restart_hy2 || true
+    fi
+    exit 1
+}
+
+relay_detail="$(check_relay || true)"
+if [ -n "$relay_detail" ]; then
+    apply_mode relay "$relay_detail"
+else
+    apply_mode direct
+fi
+EOF_CHECK
+
+    chmod 0755 "$CHECK_SCRIPT"
+
+    cat > "$LOOP_SCRIPT" <<EOF_LOOP
+#!/usr/bin/env sh
+while :; do
+    ${CHECK_SCRIPT} || true
+    sleep ${CHECK_INTERVAL}
+done
+EOF_LOOP
+    chmod 0755 "$LOOP_SCRIPT"
+}
+
+write_systemd_services() {
+    cat > /etc/systemd/system/hy2-custom.service <<EOF_HY2_SERVICE
 [Unit]
-Description=Hysteria 2 Custom Server
-After=network.target
+Description=Hysteria 2 Custom Server with SOCKS5 Failover
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/etc/hy2-custom
-ExecStart=/usr/local/bin/hy2-custom server -c /etc/hy2-custom/config.yaml
+WorkingDirectory=${BASE_DIR}
+ExecStart=${BIN_PATH} server -c ${CONFIG_FILE}
 Restart=always
+RestartSec=3
 LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF_HY2_SERVICE
+
+    cat > /etc/systemd/system/hy2-relay-monitor.service <<EOF_MONITOR_SERVICE
+[Unit]
+Description=Check Server2 SOCKS5 and switch Hysteria outbound
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${CHECK_SCRIPT}
+EOF_MONITOR_SERVICE
+
+    cat > /etc/systemd/system/hy2-relay-monitor.timer <<EOF_MONITOR_TIMER
+[Unit]
+Description=Run Hysteria SOCKS5 failover check every ${CHECK_INTERVAL} seconds
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=${CHECK_INTERVAL}s
+AccuracySec=1s
+Persistent=true
+Unit=hy2-relay-monitor.service
+
+[Install]
+WantedBy=timers.target
+EOF_MONITOR_TIMER
+
+    cat > /etc/systemd/system/hy2-custom-sub.service <<EOF_SUB_SERVICE
+[Unit]
+Description=Hysteria 2 Custom Local Subscription
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${WWW_DIR}
+ExecStart=/usr/bin/python3 -m http.server ${SUB_PORT}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF_SUB_SERVICE
+
     systemctl daemon-reload
-    systemctl enable hy2-custom >/dev/null 2>&1
-    systemctl restart hy2-custom
-elif command -v rc-update >/dev/null 2>&1; then
-    cat > /etc/init.d/hy2-custom <<EOF
+    systemctl enable hy2-custom.service >/dev/null 2>&1
+    systemctl enable hy2-custom-sub.service >/dev/null 2>&1
+    systemctl enable hy2-relay-monitor.timer >/dev/null 2>&1
+
+    # 先执行一次检查，立刻选择正确出口，不等待首个一分钟周期。
+    "$CHECK_SCRIPT" || true
+    systemctl restart hy2-custom-sub.service
+    systemctl restart hy2-relay-monitor.timer
+}
+
+write_openrc_services() {
+    cat > /etc/init.d/hy2-custom <<EOF_HY2_OPENRC
 #!/sbin/openrc-run
 name="hy2-custom"
-command="/usr/local/bin/hy2-custom"
-command_args="server -c /etc/hy2-custom/config.yaml"
+command="${BIN_PATH}"
+command_args="server -c ${CONFIG_FILE}"
 command_background=true
-pidfile="/var/run/hy2-custom.pid"
+pidfile="/run/hy2-custom.pid"
+directory="${BASE_DIR}"
 depend() {
     need net
 }
-EOF
-    chmod +x /etc/init.d/hy2-custom
-    rc-update add hy2-custom default >/dev/null 2>&1
-    rc-service hy2-custom restart >/dev/null 2>&1
-fi
+EOF_HY2_OPENRC
+    chmod 0755 /etc/init.d/hy2-custom
 
-# 8. 识别服务器信息并准备变量
-IP=$(curl -s4m3 ifconfig.me || curl -s6m3 ifconfig.me)
-LOC_INFO=$(curl -s --max-time 5 "http://ip-api.com/line/$IP?lang=zh-CN&fields=country,regionName")
-if [ -n "$LOC_INFO" ]; then
-    COUNTRY=$(echo "$LOC_INFO" | sed -n '1p')
-    REGION=$(echo "$LOC_INFO" | sed -n '2p')
-    REMARK="${COUNTRY}：${REGION} HY2独立版"
-else
-    REMARK="Hysteria2-Custom"
-fi
+    cat > /etc/init.d/hy2-relay-monitor <<EOF_MONITOR_OPENRC
+#!/sbin/openrc-run
+name="hy2-relay-monitor"
+command="${LOOP_SCRIPT}"
+command_background=true
+pidfile="/run/hy2-relay-monitor.pid"
+depend() {
+    need net
+    after hy2-custom
+}
+EOF_MONITOR_OPENRC
+    chmod 0755 /etc/init.d/hy2-relay-monitor
 
-# ==========================================
-# 9. 搭建本地订阅服务 (Clash YAML 生成)
-# ==========================================
-SUB_PORT=8180
-SUB_DIR="/etc/hy2-custom/www"
+    cat > /etc/init.d/hy2-custom-sub <<EOF_SUB_OPENRC
+#!/sbin/openrc-run
+name="hy2-custom-sub"
+command="/usr/bin/python3"
+command_args="-m http.server ${SUB_PORT}"
+command_background=true
+pidfile="/run/hy2-custom-sub.pid"
+directory="${WWW_DIR}"
+depend() {
+    need net
+}
+EOF_SUB_OPENRC
+    chmod 0755 /etc/init.d/hy2-custom-sub
 
-if command -v iptables >/dev/null 2>&1; then
-    iptables -I INPUT -p tcp --dport $SUB_PORT -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p udp --dport $TARGET_PORT -j ACCEPT 2>/dev/null || true
-fi
+    rc-update add hy2-custom default >/dev/null 2>&1 || true
+    rc-update add hy2-relay-monitor default >/dev/null 2>&1 || true
+    rc-update add hy2-custom-sub default >/dev/null 2>&1 || true
 
-cat > $SUB_DIR/clash.yaml <<EOF
+    "$CHECK_SCRIPT" || true
+    rc-service hy2-custom-sub restart
+    rc-service hy2-relay-monitor restart
+}
+
+write_subscription() {
+    local server_ip country region remark share_link
+
+    server_ip="$(curl -4fsS --max-time 8 https://ifconfig.me 2>/dev/null || true)"
+    if [ -z "$server_ip" ]; then
+        server_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    fi
+
+    country=""
+    region=""
+    if [ -n "$server_ip" ]; then
+        country="$(curl -fsS --max-time 5 "http://ip-api.com/line/${server_ip}?lang=zh-CN&fields=country" 2>/dev/null | head -n1 || true)"
+        region="$(curl -fsS --max-time 5 "http://ip-api.com/line/${server_ip}?lang=zh-CN&fields=regionName" 2>/dev/null | head -n1 || true)"
+    fi
+
+    if [ -n "$country" ] || [ -n "$region" ]; then
+        remark="${country:-本地}：${region:-出口} 自动切换"
+    else
+        remark="HY2-Relay-Auto-Failover"
+    fi
+
+    cat > "${WWW_DIR}/clash.yaml" <<EOF_CLASH
 port: 7890
 socks-port: 7891
 allow-lan: true
@@ -174,9 +460,9 @@ log-level: info
 ipv6: false
 
 proxies:
-  - name: "${REMARK}"
+  - name: "${remark}"
     type: hysteria2
-    server: ${IP}
+    server: ${server_ip}
     port: ${TARGET_PORT}
     password: "${PASSWORD}"
     sni: apps.apple.com
@@ -188,73 +474,102 @@ proxy-groups:
   - name: "PROXY"
     type: select
     proxies:
-      - "${REMARK}"
+      - "${remark}"
 
 rules:
   - MATCH,PROXY
-EOF
+EOF_CLASH
 
-if command -v systemctl >/dev/null 2>&1; then
-    cat > /etc/systemd/system/hy2-custom-sub.service <<EOF
-[Unit]
-Description=Hysteria 2 Custom Local Sub
-After=network.target
+    share_link="hysteria2://${PASSWORD}@${server_ip}:${TARGET_PORT}/?sni=apps.apple.com&insecure=1#${remark}"
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=$SUB_DIR
-ExecStart=/usr/bin/python3 -m http.server $SUB_PORT
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable hy2-custom-sub >/dev/null 2>&1
-    systemctl restart hy2-custom-sub
-    
-    HY2_STATUS=$(systemctl is-active hy2-custom)
-    SUB_STATUS=$(systemctl is-active hy2-custom-sub)
-elif command -v rc-update >/dev/null 2>&1; then
-    cat > /etc/init.d/hy2-custom-sub <<EOF
-#!/sbin/openrc-run
-name="hy2-custom-sub"
-command="/usr/bin/python3"
-command_args="-m http.server $SUB_PORT"
-command_background=true
-pidfile="/var/run/hy2-custom-sub.pid"
-directory="$SUB_DIR"
-depend() {
-    need net
+    printf '%s\n' "$server_ip" > "${BASE_DIR}/server-ip.txt"
+    printf '%s\n' "$remark" > "${BASE_DIR}/remark.txt"
+    printf '%s\n' "$share_link" > "${BASE_DIR}/share-link.txt"
 }
-EOF
-    chmod +x /etc/init.d/hy2-custom-sub
-    rc-update add hy2-custom-sub default >/dev/null 2>&1
-    rc-service hy2-custom-sub restart >/dev/null 2>&1
 
-    rc-service hy2-custom status 2>/dev/null | grep -q "started" && HY2_STATUS="active" || HY2_STATUS="inactive"
-    rc-service hy2-custom-sub status 2>/dev/null | grep -q "started" && SUB_STATUS="active" || SUB_STATUS="inactive"
-fi
+open_firewall() {
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT -p udp --dport "$TARGET_PORT" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT -p udp --dport "$TARGET_PORT" -j ACCEPT 2>/dev/null || true
+        iptables -C INPUT -p tcp --dport "$SUB_PORT" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT -p tcp --dport "$SUB_PORT" -j ACCEPT 2>/dev/null || true
+    fi
 
-# 10. 最终输出
-SHARE_LINK="hysteria2://$PASSWORD@$IP:$TARGET_PORT/?sni=apps.apple.com&insecure=1#$REMARK"
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow "${TARGET_PORT}/udp" >/dev/null 2>&1 || true
+        ufw allow "${SUB_PORT}/tcp" >/dev/null 2>&1 || true
+    fi
 
-echo ""
-echo "========================================================"
-echo "    共存版安装完成！(独立进程 + 纯净端口 2328)"
-echo "========================================================"
-echo "IP 地址: $IP"
-echo "地区备注: $REMARK"
-echo "节点端口: $TARGET_PORT (独立直连 UDP)"
-echo "固定密码: $PASSWORD"
-echo "--------------------------------------------------------"
-echo "HY2 独立进程状态       : $HY2_STATUS"
-echo "本地订阅服务状态       : $SUB_STATUS"
-echo "========================================================"
-echo -e "👉 \033[33mClash 本地订阅链接 (适用于 Clash Meta):\033[0m"
-echo -e "\033[36mhttp://$IP:$SUB_PORT/clash.yaml\033[0m"
-echo "--------------------------------------------------------"
-echo -e "👉 \033[33m通用分享链接 (用于小火箭/v2rayN/聚合机器人):\033[0m"
-echo -e "\033[32m$SHARE_LINK\033[0m"
-echo "========================================================"
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${TARGET_PORT}/udp" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port="${SUB_PORT}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+}
+
+show_result() {
+    local server_ip remark share_link mode
+    server_ip="$(cat "${BASE_DIR}/server-ip.txt" 2>/dev/null || true)"
+    remark="$(cat "${BASE_DIR}/remark.txt" 2>/dev/null || true)"
+    share_link="$(cat "${BASE_DIR}/share-link.txt" 2>/dev/null || true)"
+    mode="$(cat "$STATE_FILE" 2>/dev/null || echo unknown)"
+
+    echo
+    echo "========================================================"
+    echo "Hysteria 2 自动故障切换安装完成"
+    echo "========================================================"
+    echo "入口 IP       : ${server_ip:-未知}"
+    echo "HY2 UDP 端口  : ${TARGET_PORT}"
+    echo "订阅 TCP 端口 : ${SUB_PORT}"
+    echo "2号 SOCKS5    : ${RELAY_HOST}:${RELAY_PORT}"
+    echo "检测周期       : ${CHECK_INTERVAL} 秒"
+    echo "当前出口模式   : ${mode}"
+    echo "--------------------------------------------------------"
+    echo "relay  = 2号 SOCKS5 台湾家宽"
+    echo "direct = 1号服务器本地 IPv4"
+    echo "--------------------------------------------------------"
+    echo "Clash 订阅："
+    echo "http://${server_ip}:${SUB_PORT}/clash.yaml"
+    echo "--------------------------------------------------------"
+    echo "分享链接："
+    echo "$share_link"
+    echo "--------------------------------------------------------"
+    if command -v systemctl >/dev/null 2>&1; then
+        echo "查看切换日志：journalctl -u hy2-relay-monitor.service -f"
+        echo "手动立即检测：systemctl start hy2-relay-monitor.service"
+    else
+        echo "查看当前模式：cat ${STATE_FILE}"
+        echo "手动立即检测：${CHECK_SCRIPT}"
+    fi
+    echo "========================================================"
+}
+
+main() {
+    install_dependencies
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop hy2-relay-monitor.timer hy2-custom.service hy2-custom-sub.service 2>/dev/null || true
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service hy2-relay-monitor stop 2>/dev/null || true
+        rc-service hy2-custom stop 2>/dev/null || true
+        rc-service hy2-custom-sub stop 2>/dev/null || true
+    fi
+
+    download_hysteria
+    prepare_files
+    write_check_script
+    write_subscription
+    open_firewall
+
+    if command -v systemctl >/dev/null 2>&1; then
+        write_systemd_services
+    elif command -v rc-update >/dev/null 2>&1; then
+        write_openrc_services
+    else
+        fatal "系统既没有 systemd，也没有 OpenRC"
+    fi
+
+    show_result
+}
+
+main "$@"
