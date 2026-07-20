@@ -3,9 +3,11 @@
 
 ## 代理
 wget -O hy2.sh https://raw.githubusercontent.com/jc-lw/vps/refs/heads/main/hy2.sh && chmod +x hy2.sh && ./hy2.sh
+
 wget -O hy22.sh https://raw.githubusercontent.com/jc-lw/vps/refs/heads/main/hy22.sh && chmod +x hy22.sh && ./hy22.sh
 
 wget -O any.sh https://raw.githubusercontent.com/jc-lw/vps/refs/heads/main/any.sh && chmod +x any.sh && ./any.sh
+
 wget -O vless.sh https://raw.githubusercontent.com/jc-lw/vps/refs/heads/main/vless.sh && chmod +x vless.sh && ./vless.sh
 
 
